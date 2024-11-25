@@ -67,7 +67,7 @@ Este trabalho implementa um sistema cliente-servidor que garante o transporte co
   - colorama
 
 Para instalar as dependências:
-bash
+```bash
 pip install colorama
 
 ## Execução
