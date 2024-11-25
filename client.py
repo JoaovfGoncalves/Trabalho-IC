@@ -1,135 +1,162 @@
 import socket
-from threading import Thread, Lock
+import threading
+import time
+import os
+from collections import defaultdict
 
-def calculate_checksum(data):
-    """
-    Calcula o checksum como a soma dos valores ASCII dos caracteres na mensagem,
-    reduzido por módulo 256.
-    """
-    return sum(ord(char) for char in data) % 256
-
-def load_messages_from_file(file_path):
-    """
-    Carrega as mensagens de um arquivo de texto.
-    Cada linha do arquivo é tratada como uma mensagem separada.
-    """
-    with open(file_path, "r") as file:
-        content = file.read()
-    return content.split(", ")  # Divide as mensagens separadas por vírgula e espaço
-
-class SlidingWindowClient:
-    def __init__(self, host='127.0.0.1', port=65432, window_size=4, timeout=3, max_retries=3):
-        self.host = host
-        self.port = port
+class Client:
+    def __init__(self, packets_with_error, window_size, total_messages, protocol):
+        self.server_host = "127.0.0.1"
+        self.server_port = 63214
+        self.packets_with_error = packets_with_error
+        self.error_attempts_tracker = defaultdict(int)
         self.window_size = window_size
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.lock = Lock()
-        self.acknowledged = set()
+        self.total_messages = total_messages
+        self.protocol_type = protocol.upper()
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.client_socket.connect((self.server_host, self.server_port))
+        self.acknowledged_packets = set()
+        self.sent_packets = {}
+        self.message_timeout = 2
+        self.active_timers = {}
+        self.data_buffer = []
 
-    def send_message(self, messages, mode="burst", num_packets=None):
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((self.host, self.port))
-        client_socket.settimeout(self.timeout)
+    def perform_handshake(self):
+        handshake_message = f"HANDSHAKE|PROTOCOL|{self.protocol_type}|WINDOW|{self.window_size}"
+        self.client_socket.sendall(f"{handshake_message}\n".encode())
+        print(f"Sent: {handshake_message}")
+        server_response = self.client_socket.recv(1024).decode().strip()
 
-        print(f"\nConfiguração inicial:")
-        print(f"- Tamanho da janela deslizante: {self.window_size}")
-        print(f"- Timeout: {self.timeout}s")
-        print(f"- Número máximo de tentativas por pacote: {self.max_retries}\n")
+        if server_response.startswith(f"ACK_HANDSHAKE|PROTOCOL|{self.protocol_type}|WINDOW|{self.window_size}"):
+            print(f"Handshake confirmed by server: {server_response}")
+        else:
+            print("Handshake failed. Closing connection.")
+            self.client_socket.close()
+            exit()
 
-        if mode == "single":
-            print("Modo: Envio de um único pacote.")
-            self._send_packet(client_socket, 1, messages[0])
-        elif mode == "burst":
-            print(f"Modo: Envio de {num_packets if num_packets else 'todos'} pacotes.")
-            threads = []
-            for seq_number, message in enumerate(messages[:num_packets] if num_packets else messages, start=1):
-                t = Thread(target=self._send_packet, args=(client_socket, seq_number, message))
-                threads.append(t)
-                t.start()
+    def load_message_data(self):
+        file_path = os.path.join(os.getcwd(), "bands.txt")
+        try:
+            with open(file_path, "r") as file:
+                self.data_buffer = [line.strip() for line in file.read().split(",")]
+        except FileNotFoundError:
+            print("File 'bands.txt' not found. Using generic messages.")
+            self.data_buffer = [f"Message {i + 1}" for i in range(self.total_messages)]
 
-                if seq_number % self.window_size == 0:
-                    print(f"\n[LOG] Janela deslizante enviada: {seq_number - self.window_size + 1} - {seq_number}\n")
-                    for thread in threads:
-                        thread.join()
-                    threads = []
+    def calculate_checksum(self, message):
+        return sum(ord(c) for c in message) & 0xFFFF
 
-            for thread in threads:
-                thread.join()
+    def send_message_packet(self, sequence_number, message_content):
+        if sequence_number in self.packets_with_error and self.error_attempts_tracker[sequence_number] < 3:
+            self.error_attempts_tracker[sequence_number] += 1
+            checksum = self.calculate_checksum(message_content)
+            message_content = f"ERR|{sequence_number}|{message_content[::-1]}|{checksum}"
+            print(f"Simulating error in packet {sequence_number} (attempt {self.error_attempts_tracker[sequence_number]})")
+        elif sequence_number in self.packets_with_error and self.error_attempts_tracker[sequence_number] >= 3:
+            print(f"Packet {sequence_number} discarded after 3 failed attempts. Aborting batch.")
+            self.client_socket.sendall(f"ABORT|{sequence_number}|FAILED\n".encode())
+            return False
+        else:
+            checksum = self.calculate_checksum(message_content)
+            message_content = f"SEND|{sequence_number}|{message_content}|{checksum}"
 
-        client_socket.close()
+        try:
+            self.client_socket.sendall(f"{message_content}\n".encode())
+            self.sent_packets[sequence_number] = message_content
+            print(f"Sent: {message_content}")
+            return True
+        except Exception as e:
+            print(f"Error sending packet {sequence_number}: {e}")
+            return False
 
-        print(f"\nConfiguração final da janela deslizante:")
-        print(f"- Pacotes confirmados (ACK): {sorted(self.acknowledged)}")
-        print(f"- Último pacote enviado: {max(self.acknowledged) if self.acknowledged else 'Nenhum'}")
-
-    def _send_packet(self, client_socket, seq_number, message):
-        retries = 0
-        checksum = calculate_checksum(message)
-        full_message = f"{seq_number}|{message}|{checksum}"
-
-        while retries < self.max_retries:
-            with self.lock:
-                if seq_number in self.acknowledged:
-                    print(f"Pacote {seq_number} já confirmado anteriormente. Ignorando envio.")
+    def start_message_timer(self, sequence_number):
+        def timer_expired():
+            if sequence_number not in self.acknowledged_packets:
+                print(f"Timeout for packet {sequence_number}, retransmitting...")
+                if not self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1]):
                     return
+                self.start_message_timer(sequence_number)
 
+        if sequence_number in self.active_timers:
+            self.active_timers[sequence_number].cancel()
+
+        timer = threading.Timer(self.message_timeout, timer_expired)
+        timer.start()
+        self.active_timers[sequence_number] = timer
+
+    def cancel_message_timer(self, sequence_number):
+        if sequence_number in self.active_timers:
+            self.active_timers[sequence_number].cancel()
+            del self.active_timers[sequence_number]
+
+    def process_server_responses(self):
+        response_buffer = ""
+        while len(self.acknowledged_packets) < self.total_messages:
             try:
-                print(f"Enviando pacote: Seq: {seq_number}, Mensagem: {message}, Checksum: {checksum}")
-                client_socket.sendall(full_message.encode())
+                server_data = self.client_socket.recv(1024).decode()
+                if not server_data:
+                    break
+                response_buffer += server_data
+                while "\n" in response_buffer:
+                    line, response_buffer = response_buffer.split("\n", 1)
+                    response_parts = line.split("|")
+                    if len(response_parts) < 3:
+                        continue
+                    response_type, sequence_number_str, checksum_str = response_parts
+                    sequence_number = int(sequence_number_str)
+                    checksum = int(checksum_str)
 
-                response = client_socket.recv(1024).decode()
-                print(f"Resposta recebida: {response}")
+                    expected_checksum = f"{response_type}|{sequence_number}"
+                    if self.calculate_checksum(expected_checksum) == checksum:
+                        if response_type == "ACK":
+                            print(f"Received ACK|{sequence_number}")
+                            self.acknowledged_packets.add(sequence_number)
+                            self.cancel_message_timer(sequence_number)
+                        elif response_type == "NAK":
+                            print(f"Received NAK|{sequence_number}, retransmitting...")
+                            if sequence_number not in self.acknowledged_packets:
+                                self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1])
+                                self.start_message_timer(sequence_number)
+                        elif response_type == "ABORT":
+                            print(f"Batch aborted by server due to packet {sequence_number} failure.")
+                            return
+                    else:
+                        print(f"Corrupted response: {line}")
+            except Exception as e:
+                print(f"Error receiving server response: {e}")
 
-                if f"ACK|{seq_number}" in response or f"ACK_DUPLICATE|{seq_number}" in response:
-                    with self.lock:
-                        self.acknowledged.add(seq_number)
-                    print(f"Pacote {seq_number} confirmado.")
+    def start_sending_messages(self):
+        self.load_message_data()
+        threading.Thread(target=self.process_server_responses, daemon=True).start()
+
+        for sequence_number in range(1, self.total_messages + 1):
+            if sequence_number not in self.acknowledged_packets:
+                if not self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1]):
                     return
-                elif f"NACK|{seq_number}" in response:
-                    print(f"Pacote {seq_number} corrompido, retransmitindo...")
-            except socket.timeout:
-                print(f"Timeout para o pacote {seq_number}, retransmitindo...")
-                retries += 1
+                self.start_message_timer(sequence_number)
 
-        print(f"Falha ao enviar o pacote {seq_number} após {self.max_retries} tentativas.")
+        while len(self.acknowledged_packets) < self.total_messages:
+            time.sleep(1)
+
+        print("All packets acknowledged. Closing connection.")
+
+    def close_client_connection(self):
+        print("Waiting for final ACK confirmations...")
+        time.sleep(1)
+        self.client_socket.close()
+        print("Connection closed.")
+
+def client_menu():
+    window_size = int(input("Enter initial window size: "))
+    total_messages = int(input("Enter total number of messages to send: "))
+    protocol_type = input("Choose protocol (SR for Selective Repeat, GBN for Go-Back-N): ").upper()
+    error_packets_input = input("Enter packet numbers to simulate errors (comma-separated): ")
+    packets_with_error = list(map(int, error_packets_input.split(","))) if error_packets_input else []
+
+    client = Client(packets_with_error, window_size, total_messages, protocol_type)
+    client.perform_handshake()
+    client.start_sending_messages()
+    client.close_client_connection()
 
 if __name__ == "__main__":
-    file_path = "bandas_forro_sanitized.txt"
-    messages = load_messages_from_file(file_path)
-
-    while True:
-        try:
-            window_size = int(input("Digite o tamanho inicial da janela deslizante (ex: 4): "))
-            if window_size > 0:
-                break
-            else:
-                print("O tamanho da janela deve ser maior que 0.")
-        except ValueError:
-            print("Entrada inválida! Digite um número inteiro.")
-
-    print("\nEscolha o modo de envio:")
-    print("1. Enviar um único pacote")
-    print("2. Enviar uma rajada de pacotes")
-    mode_choice = input("Digite o número da sua escolha: ")
-
-    if mode_choice == "1":
-        mode = "single"
-        num_packets = 1
-    elif mode_choice == "2":
-        mode = "burst"
-        num_packets = input("Quantos pacotes deseja enviar na rajada? (Digite 0 para enviar todos): ")
-        try:
-            num_packets = int(num_packets)
-            if num_packets <= 0 or num_packets > len(messages):
-                num_packets = None
-        except ValueError:
-            print("Entrada inválida. Enviando todos os pacotes.")
-            num_packets = None
-    else:
-        print("Opção inválida! Usando o modo padrão: rajada de pacotes.")
-        mode = "burst"
-        num_packets = None
-
-    client = SlidingWindowClient(window_size=window_size)
-    client.send_message(messages, mode=mode, num_packets=num_packets)
+    client_menu()
