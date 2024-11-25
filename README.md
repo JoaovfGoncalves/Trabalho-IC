@@ -74,10 +74,10 @@ pip install colorama
 
 ### Iniciar o Servidor
 1. Para iniciar o servidor, execute o seguinte comando no terminal:
-   bash
+   ```bash
    python server.py
 
-### Iniciar o Servidor
+### Iniciar o Cliente
 2. Para iniciar o cliente, execute o seguinte comando no terminal:
   ```bash
    python client.py
