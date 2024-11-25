@@ -7,6 +7,9 @@ from colorama import Fore, Style, init
 # Inicializa o Colorama
 init(autoreset=True)
 
+# Tamanho máximo permitido para mensagens em bytes
+MAX_MESSAGE_SIZE = 256
+
 
 class Client:
     def __init__(self, packets_with_error, window_size, total_messages, protocol):
@@ -74,6 +77,12 @@ class Client:
             return False
 
         message_content = self.data_buffer[sequence_number - 1]
+
+        # Verificar e cortar mensagens que excedem o limite
+        if len(message_content.encode()) > MAX_MESSAGE_SIZE:
+            print(Fore.RED + f"[Warning] Message for Packet {sequence_number} exceeds {MAX_MESSAGE_SIZE} bytes. Truncating.")
+            message_content = message_content.encode()[:MAX_MESSAGE_SIZE].decode(errors='ignore')
+
         checksum = self.calculate_checksum(message_content)
 
         # Introduzir erro de integridade intencional
@@ -82,7 +91,7 @@ class Client:
             print(Fore.RED + f"[Checksum Injection] Intentionally altering checksum for Packet {sequence_number}. New checksum: {checksum}")
 
         message_content = f"SEND|{sequence_number}|{message_content}|{checksum}"
-        print(Fore.CYAN + f"[Packet Preparation] Packet {sequence_number}: Content='{self.data_buffer[sequence_number - 1]}', Checksum={checksum}")
+        print(Fore.CYAN + f"[Packet Preparation] Packet {sequence_number}: Content='{message_content}', Checksum={checksum}")
         try:
             self.client_socket.sendall(f"{message_content}\n".encode())
             self.sent_packets[sequence_number] = message_content
@@ -116,7 +125,7 @@ class Client:
 
                         # Crescimento da janela de congestionamento (Slow Start)
                         if self.cwnd < self.ssthresh:
-                            self.cwnd += 1  # Crescimento exponencial
+                            self.cwnd *= 2  # Crescimento exponencial
                             print(Fore.YELLOW + f"[Congestion Control] cwnd increased to {self.cwnd} (Slow Start).")
                         else:
                             self.cwnd = min(self.cwnd + 1, self.max_window)  # Crescimento linear após o limiar
@@ -182,10 +191,10 @@ class Client:
 
 
 def client_menu():
-    window_size = int(input("Enter initial window size: "))
-    total_messages = int(input("Enter total number of messages to send: "))
     protocol_type = input("Choose protocol (SR for Selective Repeat, GBN for Go-Back-N): ").upper()
-    error_packets_input = input("Enter packet numbers to simulate errors (comma-separated): ")
+    window_size = int(input("Enter initial window size\n>> "))
+    total_messages = int(input("Enter total number of messages to send\n>> "))
+    error_packets_input = input("Enter packet numbers to simulate errors (comma-separated)\n>> ")
     packets_with_error = list(map(int, error_packets_input.split(","))) if error_packets_input else []
 
     client = Client(packets_with_error, window_size, total_messages, protocol_type)

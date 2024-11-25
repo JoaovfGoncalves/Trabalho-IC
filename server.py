@@ -6,6 +6,9 @@ from colorama import Fore, Style, init
 # Inicializa o Colorama
 init(autoreset=True)
 
+# Tamanho máximo permitido para mensagens em bytes
+MAX_MESSAGE_SIZE = 256
+
 
 class Server:
     def __init__(self, protocol, cumulative_acks, receive_window_size):
@@ -19,16 +22,29 @@ class Server:
         self.received_messages = {}
         self.expected_sequence = 1
         self.lock = threading.Lock()
+        self.server_socket = None
+        self.running = True
 
     def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((self.server_host, self.server_port))
-        server_socket.listen(5)
-        print(Fore.GREEN + f"Server is running and waiting for connections...")
-        while True:
-            client_socket, client_address = server_socket.accept()
-            print(Fore.CYAN + f"Connection established with {client_address}.")
-            threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.bind((self.server_host, self.server_port))
+            self.server_socket.listen(5)
+            print(Fore.GREEN + f"Server is running and waiting for connections...")
+
+            while self.running:
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    print(Fore.CYAN + f"Connection established with {client_address}.")
+                    threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+                except socket.error:
+                    break
+        except KeyboardInterrupt:
+            print(Fore.RED + "\n[Shutdown] Server is shutting down...")
+            self.shutdown()
+        except Exception as e:
+            print(Fore.RED + f"[Error] {e}")
+            self.shutdown()
 
     def handle_client(self, client_socket):
         try:
@@ -72,6 +88,11 @@ class Server:
         message_type, sequence_number_str, content = message_parts[:3]
         sequence_number = int(sequence_number_str)
         checksum_received = int(message_parts[3]) if len(message_parts) > 3 else None
+
+        # Verificar tamanho da mensagem
+        if len(content.encode()) > MAX_MESSAGE_SIZE:
+            print(Fore.RED + f"[Warning] Packet {sequence_number} content exceeds {MAX_MESSAGE_SIZE} bytes. Truncating.")
+            content = content.encode()[:MAX_MESSAGE_SIZE].decode(errors='ignore')
 
         print(Fore.CYAN + f"[Message Received] Packet {sequence_number}: Type={message_type}, Content='{content}', Checksum={checksum_received}")
         if message_type == "SEND":
@@ -139,11 +160,17 @@ class Server:
             print(Fore.RED + f"[Flow Control] Sending NAK for Packet {sequence_number}.")
         connection.sendall(f"{response_type}|{sequence_number}|CONFIRM\n".encode())
 
+    def shutdown(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print(Fore.GREEN + "[Shutdown Complete] Server has been shut down.")
+
 
 def server_menu():
-    protocol = input("Choose protocol (SR for Selective Repeat, GBN for Go-Back-N): ").upper()
-    cumulative_acks = input("Enable cumulative acknowledgments? (Y/N): ").upper() == "Y"
-    receive_window_size = int(input("Enter receive window size (e.g., 5): "))
+    protocol = input("Choose protocol (SR for Selective Repeat, GBN for Go-Back-N)\n>> ").upper()
+    cumulative_acks = input("Enable cumulative acknowledgments? (Y/N)\n>> ").upper() == "Y"
+    receive_window_size = int(input("Enter receive window size\n>> "))
     server = Server(protocol, cumulative_acks, receive_window_size)
     server.start_server()
 
