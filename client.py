@@ -20,6 +20,7 @@ class Client:
         self.message_timeout = 2
         self.active_timers = {}
         self.data_buffer = []
+        self.stop_event = threading.Event()
 
     def perform_handshake(self):
         handshake_message = f"HANDSHAKE|PROTOCOL|{self.protocol_type}|WINDOW|{self.window_size}"
@@ -47,14 +48,22 @@ class Client:
         return sum(ord(c) for c in message) & 0xFFFF
 
     def send_message_packet(self, sequence_number, message_content):
+        if self.stop_event.is_set():  # Verifique se foi solicitado parar o cliente
+            return False
+
         if sequence_number in self.packets_with_error and self.error_attempts_tracker[sequence_number] < 3:
             self.error_attempts_tracker[sequence_number] += 1
             checksum = self.calculate_checksum(message_content)
             message_content = f"ERR|{sequence_number}|{message_content[::-1]}|{checksum}"
             print(f"Simulating error in packet {sequence_number} (attempt {self.error_attempts_tracker[sequence_number]})")
         elif sequence_number in self.packets_with_error and self.error_attempts_tracker[sequence_number] >= 3:
-            print(f"Packet {sequence_number} discarded after 3 failed attempts. Aborting batch.")
-            self.client_socket.sendall(f"ABORT|{sequence_number}|FAILED\n".encode())
+            print(f"Packet {sequence_number} discarded after 3 failed attempts. Sending abort signal and stopping.")
+            try:
+                self.client_socket.sendall(f"ABORT|{sequence_number}|FAILED\n".encode())
+            except Exception as e:
+                print(f"Error sending abort signal for packet {sequence_number}: {e}")
+            self.cancel_message_timer(sequence_number)
+            self.stop_client(packet=sequence_number)  # Parada brusca
             return False
         else:
             checksum = self.calculate_checksum(message_content)
@@ -71,9 +80,13 @@ class Client:
 
     def start_message_timer(self, sequence_number):
         def timer_expired():
+            if self.stop_event.is_set():  # Verifique se o cliente foi interrompido
+                return
+
             if sequence_number not in self.acknowledged_packets:
                 print(f"Timeout for packet {sequence_number}, retransmitting...")
                 if not self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1]):
+                    print(f"Abandoning packet {sequence_number} after timeout.")
                     return
                 self.start_message_timer(sequence_number)
 
@@ -91,7 +104,7 @@ class Client:
 
     def process_server_responses(self):
         response_buffer = ""
-        while len(self.acknowledged_packets) < self.total_messages:
+        while not self.stop_event.is_set():  # Pare de processar se o cliente foi interrompido
             try:
                 server_data = self.client_socket.recv(1024).decode()
                 if not server_data:
@@ -102,49 +115,57 @@ class Client:
                     response_parts = line.split("|")
                     if len(response_parts) < 3:
                         continue
-                    response_type, sequence_number_str, checksum_str = response_parts
+                    response_type, sequence_number_str, _ = response_parts
                     sequence_number = int(sequence_number_str)
-                    checksum = int(checksum_str)
 
-                    expected_checksum = f"{response_type}|{sequence_number}"
-                    if self.calculate_checksum(expected_checksum) == checksum:
-                        if response_type == "ACK":
-                            print(f"Received ACK|{sequence_number}")
-                            self.acknowledged_packets.add(sequence_number)
-                            self.cancel_message_timer(sequence_number)
-                        elif response_type == "NAK":
-                            print(f"Received NAK|{sequence_number}, retransmitting...")
-                            if sequence_number not in self.acknowledged_packets:
-                                self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1])
-                                self.start_message_timer(sequence_number)
-                        elif response_type == "ABORT":
-                            print(f"Batch aborted by server due to packet {sequence_number} failure.")
-                            return
-                    else:
-                        print(f"Corrupted response: {line}")
+                    if response_type == "ACK":
+                        print(f"Received ACK|{sequence_number}")
+                        self.acknowledged_packets.add(sequence_number)
+                        self.cancel_message_timer(sequence_number)
+                    elif response_type == "NAK":
+                        print(f"Received NAK|{sequence_number}, retransmitting...")
+                        if sequence_number not in self.acknowledged_packets:
+                            self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1])
+                            self.start_message_timer(sequence_number)
+                    elif response_type == "ABORT":
+                        print(f"Batch aborted by server due to packet {sequence_number} failure.")
+                        return
             except Exception as e:
-                print(f"Error receiving server response: {e}")
+                if not self.stop_event.is_set():
+                    print(f"Error receiving server response: {e}")
 
     def start_sending_messages(self):
         self.load_message_data()
         threading.Thread(target=self.process_server_responses, daemon=True).start()
 
         for sequence_number in range(1, self.total_messages + 1):
+            if self.stop_event.is_set():  # Pare o envio se o cliente foi interrompido
+                break
+
             if sequence_number not in self.acknowledged_packets:
                 if not self.send_message_packet(sequence_number, self.data_buffer[sequence_number - 1]):
                     return
                 self.start_message_timer(sequence_number)
 
-        while len(self.acknowledged_packets) < self.total_messages:
+        while len(self.acknowledged_packets) < self.total_messages and not self.stop_event.is_set():
             time.sleep(1)
 
         print("All packets acknowledged. Closing connection.")
 
     def close_client_connection(self):
-        print("Waiting for final ACK confirmations...")
-        time.sleep(1)
+        self.stop_event.set()  # Sinaliza interrupção
+        for timer in self.active_timers.values():
+            timer.cancel()
         self.client_socket.close()
         print("Connection closed.")
+
+    def stop_client(self, packet=None):
+        if packet is not None:
+            print(f"Stopping client abruptly due to repeated errors in packet {packet}.")
+        else:
+            print("Stopping client abruptly due to unknown error.")
+        self.close_client_connection()
+        exit()
 
 def client_menu():
     window_size = int(input("Enter initial window size: "))
