@@ -67,14 +67,13 @@ Este trabalho implementa um sistema cliente-servidor que garante o transporte co
   - colorama
 
 Para instalar as dependências:
-    	```bash
 pip install colorama
 
 ## Execução
 
 ### Iniciar o Servidor
 1. Para iniciar o servidor, execute o seguinte comando no terminal:
-    ```bash
+   ```bash
    python server.py
 
 ### Iniciar o Cliente
